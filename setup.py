@@ -3,8 +3,7 @@ import os
 import sys
 from setuptools import setup
 
-#sys.path.append("hera_pspec")
-import version
+#import version
 
 setup_args = {
     'name': 'VisModel',
