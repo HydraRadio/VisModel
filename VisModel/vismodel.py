@@ -16,7 +16,8 @@ class VisModel(object):
                  free_params_antpos=[], free_params_beam=[], 
                  free_params_ptsrc=[],
                  free_beams=[], free_ants=[], free_ptsrcs=[],
-                 verbose=False, comm=None):
+                 extra_opts_viscpu={},
+                 verbose=False, comm=None,):
         """
         Construct a model for a set of visibility data from a series 
         of data model components. This object handles caching of 
@@ -47,6 +48,9 @@ class VisModel(object):
             are to have their parameters varied. The ordering 
             maps to the parameter vector.
         
+        extra_opts_viscpu : dict, optional
+            Extra kwargs to pass to the VisCPU Simulate() class. Default: {}.
+        
         verbose : bool, optional
             Whether to print debug messages. Default: True.
         
@@ -63,7 +67,10 @@ class VisModel(object):
         
         # General settings
         self._freqs = np.unique(self.uvd.freq_array)
-        self._ant_index = self.uvd.antenna_numbers
+        self._ant_index = self.uvd.get_ants() # only data antennas
+        
+        # Extra precision options for VisCPU
+        self.extra_opts_viscpu = extra_opts_viscpu
         
         # Initial antenna positions (for antennas with free positions)
         self.antpos_initial = {}
@@ -231,7 +238,8 @@ class VisModel(object):
             precision=2,                              # fixed
             use_pixel_beams=False, # Do not use pixel beams
             bm_pix=10,
-            mpi_comm=self.comm
+            mpi_comm=self.comm,
+            **self.extra_opts_viscpu
         )
         
         # Run simulation
