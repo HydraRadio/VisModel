@@ -66,9 +66,59 @@ class VisLike(object):
             "Model and data have different shape"
     
     
-    def logl(self, params):
+    def logl(self, params, apply_gains=False):
         """
-        Calculate the log-likelihood.
+        Calculate the log-likelihood for a set of parameters.
+        
+        Parameters
+        ----------
+        params : array_like
+            Array of parameters to calculate the log-likelihood for. The array 
+            must be in the order specified by `self.model.param_names()`.
+        
+        apply_gains : bool, optional
+            Whether the gain model should be applied to the model visibilities 
+            or not. Set to False if the data are calibrated and you are not 
+            sampling gain parameters. Default: False.
+        """
+        # Calculate model visibilities for current set of parameters
+        model = self.model.model(params)
+        
+        # Pre-fetch freqs and lsts arrays
+        freqs = np.unique(self.data.freq_array)
+        lsts = np.unique(self.data.lst_array)
+        
+        # Loop over available data
+        logl = 0
+        for key, d in self.data.antpairpol_iter():
+            
+            # Get flags and model
+            f = ~self.data.get_flags(key)
+            mdl = model.get_data(key)
+            
+            # Apply gains
+            g1, g2 = 1., 1.
+            if apply_gains:
+                ant1, ant2, _ = key
+                g1 = self.model.gains_for_antenna(ant1, freqs=freqs, lsts=lsts)
+                g2 = self.model.gains_for_antenna(ant2, freqs=freqs, lsts=lsts)
+            
+            # Calculate diff. between model and data, and no. degrees of freedom
+            delta = d - (g1 * np.conj(g2) * mdl)
+            Ndof = 2. * np.sum(~f) # factor of 2 for real + imag
+            
+            # Calculate log-likelihood
+            _logl = -0.5 * f*(delta.real**2. + delta.imag**2.) \
+                    / self.var \
+                    - 0.5 * np.log(2.*np.pi*self.var) * (Ndof)
+            logl += np.sum(_logl)
+        return logl
+    
+    
+    def logl_direct(self, params):
+        """
+        Calculate the log-likelihood by directly comparing the `data_array` for 
+        the model and data UVData objects.
         """
         model = self.model.model(params)
         flags = ~self.data.flag_array
@@ -77,4 +127,4 @@ class VisLike(object):
              - 0.5 * np.log(2.*np.pi*self.var) * self.data.data_array.size
         return np.sum(logl)
         
-        
+
