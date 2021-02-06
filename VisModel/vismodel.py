@@ -4,6 +4,7 @@ from pyuvdata import UVData
 
 from hera_sim.visibilities import VisCPU
 from hera_sim.beams import PolyBeam, PerturbedPolyBeam
+from .models import bandpass_only_gains
 import time, copy, sys
 
 
@@ -12,10 +13,12 @@ class VisModel(object):
     def __init__(self, uvd_init, 
                  ptsrc_ra_dec, ptsrc_flux,
                  beam_model=PerturbedPolyBeam, 
+                 gain_model=bandpass_only_gains,
                  default_beam_params={},
                  free_params_antpos=[], free_params_beam=[], 
-                 free_params_ptsrc=[],
-                 free_beams=[], free_ants=[], free_ptsrcs=[],
+                 free_params_ptsrc=[], free_params_gains=[],
+                 free_beams=[], free_ants=[], free_ants_gains=[], 
+                 free_ptsrcs=[],
                  extra_opts_viscpu={},
                  verbose=False, comm=None,):
         """
@@ -36,14 +39,20 @@ class VisModel(object):
             Beam model class to be used for the primary beams.
             Default: PerturbedPolyBeam
         
+        gain_model : func, optional
+            Function that takes in gain model parameters, frequencies, 
+            and LSTs for a given antenna and outputs gain values. Function 
+            must have call signature: `fn(freqs, lsts, params)`, where 
+            `freqs` and `lsts` are 1D arrays.
+        
         default_beam_params : dict
             Default values of all beam model parameters.
         
-        free_params_antpos, free_params_beam, free_params_ptsrc : lists of str
+        free_params_antpos, free_params_beam, free_params_ptsrc, free_params_gains : lists of str
             Ordered lists of names of parameters to be varied. 
             The ordering maps to the parameter vector.
         
-        free_beams, free_ants, free_ptsrcs : list of int
+        free_beams, free_ants, free_ants_gains, free_ptsrcs : list of int
             Ordered list of which beams/antennas/point sources 
             are to have their parameters varied. The ordering 
             maps to the parameter vector.
@@ -83,6 +92,12 @@ class VisModel(object):
         self.beams = [[] for i in range(self.uvd.Nants_data)]
         self.default_beam_params = default_beam_params
         
+        # Initial gain models for all antennas
+        self.gain_model = gain_model
+        self.gain_params = {}
+        for ant in self.uvd.get_ants():
+            self.gain_params[ant] = None
+        
         # Point source catalogue
         self.ptsrc_ra_dec = ptsrc_ra_dec.copy()
         self.ptsrc_flux = ptsrc_flux.copy()
@@ -93,8 +108,10 @@ class VisModel(object):
         self.free_params_antpos = free_params_antpos
         self.free_params_beam = free_params_beam
         self.free_params_ptsrc = free_params_ptsrc
+        self.free_params_gains = free_params_gains
         self.free_beams = free_beams
         self.free_ants = free_ants
+        self.free_ants_gains = free_ants_gains
         self.free_ptsrcs = free_ptsrcs
         
         # MPI handling
@@ -190,6 +207,57 @@ class VisModel(object):
                              params[self.free_params_ptsrc.index('flux_factor')]
     
     
+    def set_gain_params(self, ant, params):
+        """
+        Set the parameters of the complex gain model for an antenna.
+        
+        Parameters
+        ----------
+        ant : int
+            Antenna ID.
+            
+        params : array_like
+            Vector of parameters. Names and ordering are defined in 
+            `self.free_params_gains`.
+        """
+        if ant not in self.gain_params.keys():
+            raise KeyError("Antenna '%s' not found." % ant)
+        self.gain_params[ant] = params
+    
+    
+    def gains_for_antenna(self, ant, freqs=None, lsts=None):
+        """
+        Return the complex gains as a 2D array in frequency and 
+        time for a given antenna.
+        
+        Parameters
+        ----------
+        ant : int
+            Antenna ID.
+        
+        freqs, lsts : array_like, optional
+            1D arrays of frequencies and times, defining the grid that the 
+            gains will be evaluated on. If None, these will be taken from the 
+            `self.uvd` UVData object.
+            Default: None.
+        
+        Returns
+        -------
+        gains : array_like, complex
+            2D complex gain array.
+        """
+        if ant not in self.gain_params.keys():
+            raise KeyError("Antenna '%s' not found." % ant)
+        
+        # Get freqs/lsts arrays if not specified
+        if freqs is None:
+            freqs = np.unique(self.uvd.freq_array)
+        if lsts is None:
+            lsts = np.unique(self.uvd.lst_array)
+        
+        # Evaluate model and return
+        return self.gain_model(freqs, lsts, self.gain_params[ant])
+    
     def param_names(self):
         """
         Return list of parameter names in order.
@@ -273,20 +341,25 @@ class VisModel(object):
         
         # Count free parameters and antennas/beams
         Nfree_ants = len(self.free_ants)
+        Nfree_ants_gains = len(self.free_ants_gains)
         Nfree_beams = len(self.free_beams)
         Nfree_ptsrcs = len(self.free_ptsrcs)
         Nparams_ants = len(self.free_params_antpos)
         Nparams_beams = len(self.free_params_beam)
+        Nparams_gains = len(self.free_params_gains)
         Nparams_ptsrcs = len(self.free_params_ptsrc)
         
         # Extract parameters in blocks and reshape
         iants = Nfree_ants * Nparams_ants
         ibeams = Nfree_beams * Nparams_beams
+        igains = Nfree_ants_gains * Nparams_gains
         iptsrcs = Nfree_ptsrcs * Nparams_ptsrcs
         antpos_params = params[0:iants].reshape((Nfree_ants, Nparams_ants))
         beam_params = params[iants:iants+ibeams].reshape((Nfree_beams, Nparams_beams))
-        ptsrc_params = params[iants+ibeams:iants+ibeams+iptsrcs].reshape(
-                                                (Nfree_ptsrcs, Nparams_ptsrcs) )
+        gain_params = params[iants+ibeams:iants+ibeams+igains].reshape(
+                                              (Nfree_ants_gains, Nparams_gains))
+        ptsrc_params = params[iants+ibeams+igains:iants+ibeams+igains+iptsrcs].reshape(
+                                              (Nfree_ptsrcs, Nparams_ptsrcs))
         
         # (1) Antenna positions
         for i, ant in enumerate(self.free_ants):
@@ -299,6 +372,10 @@ class VisModel(object):
         # (3) Point source parameters
         for i in self.free_ptsrcs:
             self.set_ptsrc_params(i, ptsrc_params[i])
+        
+        # (4) Gain model parameters (not applied to data yet)
+        for i, ant in enumerate(self.free_ants_gains):
+            self.set_gain_params(ant, gain_params[i])
         
         # Run simulation
         _uvd = self.simulate()
