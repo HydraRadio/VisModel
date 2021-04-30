@@ -452,7 +452,7 @@ class VisModel(object):
         uvd : UVData object
             Simulated visibilities.
         """
-        
+        obs = self.healvis_observatory
         ###obs.set_beam(beam_list) # beam list
         
         # Run simulation
@@ -461,9 +461,10 @@ class VisModel(object):
         tstart = time.time()
         
         # Compute visibilities
-        gsm_vis, _times, _bls = obs.make_visibilities(self.diffuse_gsm,
+        gsm_vis, _times, _bls = obs.make_visibilities(
+                                              self.diffuse_gsm,
                                               beam_pol=cfg_diffuse['beam_pol'], 
-                                              Nprocs=cfg_diffuse['nprocs'])
+                                              Nprocs=cfg_diffuse['nprocs'] )
         
         if self.verbose:
             print("  Simulation took %2.1f sec" % (time.time() - tstart))
