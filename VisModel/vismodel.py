@@ -17,6 +17,8 @@ HEALVIS_OPTS_DEFAULT = {
     'obs_longitude':    21.4283055554,
     'obs_height':       1073.,
     'nside':            64,
+    'beam_pol':         'XX', 
+    'Nprocs':           1,
 }
 
 
@@ -227,6 +229,7 @@ class VisModel(object):
                                                    ants[i], 
                                                    ants[j])
                 healvis_bls.append(_bl)
+        self.healvis_bls = healvis_bls
         
         # Set times
         times = np.unique(self.uvd.time_array)
@@ -238,7 +241,7 @@ class VisModel(object):
         obs = healvis.observatory.Observatory(healvis_opts['obs_latitude'], 
                                               healvis_opts['obs_longitude'], 
                                               healvis_opts['obs_height'],
-                                              array=healvis_bls, 
+                                              array=self.healvis_bls, 
                                               freqs=self._freqs)
         obs.set_pointings(times)
         obs.set_fov(fov)
@@ -453,7 +456,6 @@ class VisModel(object):
             Simulated visibilities.
         """
         obs = self.healvis_observatory
-        ###obs.set_beam(beam_list) # beam list
         
         # Run simulation
         if self.verbose:
@@ -461,10 +463,11 @@ class VisModel(object):
         tstart = time.time()
         
         # Compute visibilities
+        # FIXME: Need to use polarisation info properly
         gsm_vis, _times, _bls = obs.make_visibilities(
-                                              self.diffuse_gsm,
-                                              beam_pol=cfg_diffuse['beam_pol'], 
-                                              Nprocs=cfg_diffuse['nprocs'] )
+                                        self.diffuse_gsm,
+                                        beam_pol=self.healvis_opts['beam_pol'], 
+                                        Nprocs=self.healvis_opts['Nprocs'] )
         
         if self.verbose:
             print("  Simulation took %2.1f sec" % (time.time() - tstart))
@@ -526,15 +529,28 @@ class VisModel(object):
         
         # Run point source simulation
         _uvd = self.simulate_point_sources()
-        self.uvd = _uvd
         
         # Run diffuse model simulation
         if self.include_diffuse:
             vis_gsm, _times, _bls = self.simulate_diffuse()
             
-            # Add to UVData object
-            # FIXME
+            # Check that ordering of healvis output matches existing uvd object
+            antpairs_hvs = [(self.healvis_bls[i].ant1, self.healvis_bls[i].ant2) 
+                            for i in _bls]
+            antpairs_uvd = [_uvd.baseline_to_antnums(_b) 
+                            for _b in _uvd.baseline_array]
             
+            assert antpairs_hvs == antpairs_uvd, \
+                                     "healvis 'bls' array does not match the " \
+                                     "ordering of existing UVData.baseline_array"
+            assert np.all(_times == uvd.time_array), \
+                                     "healvis 'times' array does not match the " \
+                                     "ordering of existing UVData.time_array"
+            
+            # Add diffuse data to UVData object
+            _uvd.data_array[:,:,:,0] += vis_gsm
         
+        # Update internal UVData array and return
+        self.uvd = _uvd
         return _uvd
         
