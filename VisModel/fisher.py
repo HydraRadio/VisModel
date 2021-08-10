@@ -2,7 +2,7 @@
 import numpy as np
 
 
-def calc_fisher(model, fiducial, dx=0.01, verbose=True):
+def calc_fisher(model, fiducial, var, dx=0.01, verbose=True):
     """
     Calculate Fisher matrix from a model.
     
@@ -15,8 +15,12 @@ def calc_fisher(model, fiducial, dx=0.01, verbose=True):
         Fiducial vector of model parameters, in the same ordering as 
         `model.param_names()`.
     
+    var : float
+        Estimate of the noise variance of the data.
+    
     dx : float, optional
         Finite difference for all parameters. Default: 0.01.
+    
     
     verbose : bool, optional
         Whether to print debug messages. Default: True.
