@@ -69,7 +69,7 @@ def calc_fisher(model, fiducial, var, dx=0.01, verbose=True):
     return F
 
 
-def calc_fisher_bigmem(model, fiducial, dx=0.01, verbose=True):
+def calc_fisher_bigmem(model, fiducial, var, dx=0.01, verbose=True):
     """
     Calculate Fisher matrix from a model. Stores the derivatives in memory for 
     faster computation (but uses much more memory).
@@ -82,6 +82,9 @@ def calc_fisher_bigmem(model, fiducial, dx=0.01, verbose=True):
     fiducial : array_like
         Fiducial vector of model parameters, in the same ordering as 
         `model.param_names()`.
+    
+    var : float
+        Estimate of the noise variance of the data.
     
     dx : float, optional
         Finite difference for all parameters. Default: 0.01.
