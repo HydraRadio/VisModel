@@ -7,6 +7,16 @@ import hera_pspec as hp
 import hera_cal as hc
 from hera_sim import io
 
+import astropy_healpix
+import healpy as hp
+
+import pyradiosky
+from pyradiosky import SkyModel
+
+from astropy.units import sday, rad
+from astropy import units
+from astropy.coordinates.angles import Latitude, Longitude
+
 import copy, yaml
 
 
@@ -505,6 +515,80 @@ def load_ptsrc_catalog(cat_name, freqs, freq0=1.e8, usecols=(10,12,77,-5), sort=
         rad_dec_sorted = ra_dec[idxs,:]
     
     return ra_dec, flux
+
+
+def gsm_sky_model(freqs, resolution="hi", nside=None):
+    """
+    Return a pyradiosky SkyModel object populated with a Global Sky Model datacube in 
+    healpix format.
+
+    Parameters
+    ----------
+    freqs : array_like
+        Frequency array, in Hz.
+
+    resolution : str, optional
+        Whether to use the high or low resolution pygdsm maps. Options are 'hi' or 'low'.
+
+    nside : int, optional
+        Healpix nside to up- or down-sample the GSM sky model to. Default: `None` (use the 
+        default from `pygdsm`, which is 1024).
+
+    Returns
+    -------
+    sky_model : pyradiosky.SkyModel
+        SkyModel object.
+    """
+    import pygdsm
+    
+    # Initialise GSM object
+    gsm = pygdsm.GlobalSkyModel2016(data_unit="TRJ", resolution=resolution, freq_unit="Hz")
+
+    # Construct GSM datacube
+    hpmap = gsm.generate(freqs=freqs) # FIXME: nside=1024, ring ordering, galactic coords
+    hpmap_units = "K"
+
+    # Set nside or resample
+    nside_gsm = int(astropy_healpix.npix_to_nside(hpmap.shape[-1]))
+    if nside is None:
+        # Use default nside from pygdsm map
+        nside = nside_gsm
+    else:
+        # Transform to a user-selected nside
+        hpmap_new = np.zeros((hpmap.shape[0], astropy_healpix.nside_to_npix(nside)), 
+                             dtype=hpmap.dtype)
+        for i in range(hpmap.shape[0]):
+            hpmap_new[i,:] = hp.ud_grade(hpmap[i,:], 
+                                         nside_out=nside, 
+                                         order_in="RING", 
+                                         order_out="RING")
+        hpmap = hpmap_new
+
+    # Get datacube properties
+    npix = astropy_healpix.nside_to_npix(nside)
+    indices = np.arange(npix)
+    history = "pygdsm.GlobalSkyModel2016, data_unit=TRJ, resolution=low, freq_unit=MHz"
+    freq = units.Quantity(freqs, "hertz")
+
+    # hmap is in K
+    stokes = units.Quantity(np.zeros((4, len(freq), len(indices))), hpmap_units)
+    stokes[0] = hpmap * units.Unit(hpmap_units)
+
+    # Construct pyradiosky SkyModel
+    sky_model = pyradiosky.SkyModel(
+                                    nside=nside,
+                                    hpx_inds=indices,
+                                    stokes=stokes,
+                                    spectral_type="full",
+                                    freq_array=freq,
+                                    history=history,
+                                    frame="galactic",
+                                    hpx_order="ring"
+                                )
+
+    sky_model.healpix_interp_transform(frame='icrs', full_sky=True, inplace=True) # do coord transform
+    assert sky_model.component_type == "healpix"
+    return sky_model
 
 
 def load_config(config_file, cfg_default):

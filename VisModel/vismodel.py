@@ -1,31 +1,24 @@
 
 import numpy as np
 from pyuvdata import UVData
+from pyradiosky import SkyModel
 
-from hera_sim.visibilities import VisCPU
-try:
-    import healvis
-except:
-    print("healvis import failed; diffuse mode unavailable")
+from hera_sim.visibilities import VisibilitySimulation, ModelData, VisCPU
 from hera_sim.beams import PolyBeam, PerturbedPolyBeam
+
+from astropy.units import sday, rad
+from astropy import units
+from astropy.coordinates.angles import Latitude, Longitude
+
 from .gains import BaseGainModel
+from .utils import gsm_sky_model
 import time, copy, sys
-
-
-HEALVIS_OPTS_DEFAULT = {
-    'obs_latitude':     -30.7215277777,
-    'obs_longitude':    21.4283055554,
-    'obs_height':       1073.,
-    'nside':            64,
-    'beam_pol':         'XX', 
-    'Nprocs':           1,
-}
 
 
 class VisModel(object):
     
-    def __init__(self, uvd_init, 
-                 ptsrc_ra_dec, ptsrc_flux,
+    def __init__(self, uvd_init=None, 
+                 ptsrc_ra=None, ptsrc_dec=None, ptsrc_flux=None,
                  beam_model=PerturbedPolyBeam, 
                  gain_model=None,
                  default_beam_params={},
@@ -34,8 +27,9 @@ class VisModel(object):
                  free_beams=[], free_ants=[], free_ants_gains=[], 
                  free_ptsrcs=[], 
                  extra_opts_viscpu={},
-                 healvis_opts=HEALVIS_OPTS_DEFAULT,
-                 include_diffuse=False, verbose=False, comm=None):
+                 include_diffuse=False, 
+                 diffuse_nside=32,
+                 verbose=False, comm=None):
         """
         Construct a model for a set of visibility data from a series 
         of data model components. This object handles caching of 
@@ -47,8 +41,8 @@ class VisModel(object):
             UVData object with the correct data shape (number of frequencies, 
             times, polarisations, antennas).
         
-        ptsrc_ra_dec, ptsrc_flux : array_like
-            Point source position and flux arrays.
+        ptsrc_ra, ptsrc_dec, ptsrc_flux : array_like
+            Point source position and flux arrays. RA and Dec should be in radians.
         
         beam_model : UVBeam, optional
             Beam model class to be used for the primary beams.
@@ -74,12 +68,12 @@ class VisModel(object):
         extra_opts_viscpu : dict, optional
             Extra kwargs to pass to the VisCPU Simulate() class. Default: {}.
         
-        healvis_opts : dict, optional
-            Dictionary of settings for healvis. Default: HEALVIS_OPTS_DEFAULT
-        
         include_diffuse : bool, optional
             Whether to include a diffuse model in the visibility model. This 
-            uses healvis and GSM as the model. Default: False.
+            uses GSM as the model. Default: False.
+
+        diffuse_nside : int, optional
+            Healpix map nside for the diffuse model. Default: 32.
         
         verbose : bool, optional
             Whether to print debug messages. Default: True.
@@ -87,6 +81,8 @@ class VisModel(object):
         comm : MPI communicator, optional
             MPI communicator to be passed to simulator. Default: None.
         """
+        tstart = time.time()
+        
         # Set basic parameters
         assert isinstance(uvd_init, UVData), \
             "uvd_init must be a valid UVData object"
@@ -142,10 +138,16 @@ class VisModel(object):
             self.gain_params[pol][ant] = self.gain_model.params[pol][ant]
         
         # Point source catalogue
-        self.ptsrc_ra_dec = ptsrc_ra_dec.copy()
+        self.ptsrc_ra = ptsrc_ra.copy()
+        self.ptsrc_dec = ptsrc_dec.copy()
         self.ptsrc_flux = ptsrc_flux.copy()
-        self.ptsrc_delta_radec = np.zeros(self.ptsrc_ra_dec.shape)
-        self.ptsrc_flux_factor = np.ones(self.ptsrc_ra_dec.shape[0])
+        self.ptsrc_delta_ra = np.zeros(self.ptsrc_ra.shape)
+        self.ptsrc_delta_dec = np.zeros(self.ptsrc_dec.shape)
+        self.ptsrc_flux_factor = np.ones(self.ptsrc_ra.size)
+        assert self.ptsrc_ra.size == self.ptsrc_dec.size == self.ptsrc_flux.shape[-1], \
+            "ptsrc_ra, ptsrc_dec, ptsrc_flux have inconsistent shapes"
+        assert self.ptsrc_ra.size >= len(free_ptsrcs), \
+            "free_ptsrcs must not have more sources than the total no. of sources in the sky model"
         
         # Mappings between param vector and param names
         self.free_params_antpos = free_params_antpos
@@ -157,32 +159,6 @@ class VisModel(object):
         self.free_ants_gains = free_ants_gains
         self.free_ptsrcs = free_ptsrcs
         
-        # Set up diffuse model
-        self.include_diffuse = include_diffuse
-        self.healvis_opts = healvis_opts
-        self.diffuse_vis = 0
-        healvis_enabled = True
-        try:
-            healvis.__file__
-        except:
-            healvis_enabled = False
-            if self.include_diffuse:
-                raise ImportError("`include_diffuse` set to True, but failed "
-                                  "to import healvis")
-        
-        # Create healvis baseline spec
-        if self.include_diffuse:
-            
-            # Set up healvis array model
-            self._set_antpos_healvis()
-            
-            # Create GSM sky model
-            self.diffuse_gsm = healvis.sky_model.construct_skymodel(
-                                              'gsm', 
-                                              freqs=self._freqs, 
-                                              ref_chan=0,
-                                              Nside=self.healvis_opts['nside'] )
-        
         # MPI handling
         self.comm = comm
         
@@ -190,12 +166,25 @@ class VisModel(object):
         for i in range(self.uvd.Nants_data):
             self.beams[i] = self.BeamClass(**self.default_beam_params)
         
+        # Set up diffuse model
+        self.include_diffuse = include_diffuse
+        self.diffuse_nside = diffuse_nside
+        if self.include_diffuse:
+            
+            # Build SkyModel from GSM (pygdsm)
+            self.gsm_sky = gsm_sky_model(self._freqs, 
+                                         resolution="hi", 
+                                         nside=self.diffuse_nside)
+
         # Model visibility:
         #   Antenna positions
         #   Primary beam models
         #   Sky model: point sources
         #   Sky model: Gaussian sources
         #   Sky model: diffuse
+
+        if self.verbose:
+            print("  VisModel init took %2.1f sec" % (time.time() - tstart))
     
     
     def set_antpos(self, ant, params):
@@ -221,55 +210,6 @@ class VisModel(object):
         
         # Update antenna positions
         self.uvd.antenna_positions[ant] = self.antpos_initial[ant] + vec
-        
-        # Update healvis baseline spec if needed
-        if self.include_diffuse:
-            self._set_antpos_healvis()
-    
-    
-    def _set_antpos_healvis(self):
-        """
-        Update healvis baselines when position of antennas has changed.
-        Positions are taken from `self.uvd.antenna_positions`.
-        """
-        # Construct antenna list
-        pos_array = []
-        ants = self._ant_index
-        for ant in ants:
-            pos = self.uvd.antenna_positions[
-                                np.where(self.uvd.antenna_numbers == ant) ]
-            pos_array.append(pos)
-        
-        # Construct baseline list
-        healvis_bls = []
-        for i in range(len(ants)):
-            for j in range(i, len(ants)):
-                _bl = healvis.observatory.Baseline(pos_array[i], 
-                                                   pos_array[j], 
-                                                   ants[i], 
-                                                   ants[j])
-                healvis_bls.append(_bl)
-        self.healvis_bls = healvis_bls
-        
-        # Set times
-        times = np.unique(self.uvd.time_array)
-        Ntimes = times.size
-
-        # Create Observatory object
-        fov = 360. # deg
-        healvis_opts = self.healvis_opts
-        obs = healvis.observatory.Observatory(healvis_opts['obs_latitude'], 
-                                              healvis_opts['obs_longitude'], 
-                                              healvis_opts['obs_height'],
-                                              array=self.healvis_bls, 
-                                              freqs=self._freqs)
-        obs.set_pointings(times)
-        obs.set_fov(fov)
-        
-        # Update beam list
-        obs.set_beam(self.beams)
-        
-        self.healvis_observatory = obs
     
     
     def set_beam(self, ant, params):
@@ -298,10 +238,6 @@ class VisModel(object):
         idx = np.where(self._ant_index == ant)[0][0]
         self.beams[idx] = self.BeamClass(**param_dict)
         # First arg is: perturb_coeffs=[0.,]
-        
-        # Update beams for diffuse model (healvis) if needed
-        if self.include_diffuse:
-            self.healvis_observatory.set_beam(self.beams)
     
     
     def set_ptsrc_params(self, i, params):
@@ -319,10 +255,10 @@ class VisModel(object):
         """
         # Set point source parameters if specified
         if 'delta_ra' in self.free_params_ptsrc:
-            self.ptsrc_delta_radec[i][0] = \
+            self.ptsrc_delta_ra[i] = \
                              params[self.free_params_ptsrc.index('delta_ra')]
         if 'delta_dec' in self.free_params_ptsrc:
-            self.ptsrc_delta_radec[i][1] = \
+            self.ptsrc_delta_dec[i] = \
                              params[self.free_params_ptsrc.index('delta_dec')]
         if 'flux_factor' in self.free_params_ptsrc:
             self.ptsrc_flux_factor[i] = \
@@ -468,7 +404,54 @@ class VisModel(object):
         
         return pnames
     
-    
+
+    def info(self):
+        """
+        Print basic info about the VisModel object, including the shape and size of 
+        the data model and sky model. 
+        """
+        # Basic info about the data
+        print("")
+        print("="*60)
+        print("-"*40)
+        print("VisModel data layout")
+        print("-"*40)
+        print("Freqs:     %d (%6.2f -- %6.2f MHz)" % (self._freqs.size, 
+                                                     self._freqs.min()/1e6,
+                                                     self._freqs.max()/1e6))
+        print("Times:     %d (%6.2f -- %6.2f)" % (self._times.size, 
+                                                 self._times.min(),
+                                                 self._times.max()))
+        print("Pols:      %d" % len(self._pols))
+        print("          ", self._pols)
+        ants = self.uvd.get_ants()
+        print("Data ants: %d" % len(ants))
+        print("          ", ants)
+
+        # Basic info about the sky model
+        print("")
+        print("-"*40)
+        print("Sky model")
+        print("-"*40)
+        print("Point srcs:    %d" % self.ptsrc_ra.size)
+        print("               %d free parameters" % len(self.free_params_ptsrc))
+        print("Diffuse model: %s" % self.include_diffuse)
+        if self.include_diffuse:
+            print("    nside:     %d" % self.diffuse_nside)
+
+        # Simple memory usage
+        print("")
+        print("-"*40)
+        print("Basic memory usage")
+        print("-"*40)
+        print("uvdata:         %7.2f MB" % (self.uvd.data_array.nbytes/(1024**2)))
+        print("ptsrc model:    %7.2f MB" % \
+            ((self.ptsrc_flux.nbytes + 2*self.ptsrc_ra.nbytes)/(1024**2)))
+        if self.include_diffuse:
+            print("gsm_sky model:  %7.2f MB" % (self.gsm_sky.stokes.nbytes/(1024**2)))
+        print("="*60)
+
+
     def simulate_point_sources(self, comm=None):
         """
         Simulate point source visibilities for the current state of the model.
@@ -487,37 +470,50 @@ class VisModel(object):
         # Need to zero the array, which is usually returned by 
         # reference rather than copied
         self.uvd.data_array *= 0.
-        
-        # Construct new simulator class with updated settings
-        simulator = VisCPU(
-            uvdata=self.uvd,                          # fixed
-            beams=self.beams,                         # varies
-            beam_ids=self._ant_index,                 # fixed
-            sky_freqs=self._freqs,                    # fixed
-            point_source_pos=self.ptsrc_ra_dec + self.ptsrc_delta_radec, # varies
-            point_source_flux=self.ptsrc_flux * self.ptsrc_flux_factor,  # varies
-            polarized = False,                        # assumes Stokes I for now
-            precision=2,                              # fixed
-            use_pixel_beams=False,                    # Do not use pixel beams
-            bm_pix=1,
-            mpi_comm=comm,
-            **self.extra_opts_viscpu
-        )
+
+        # Construct SkyModel object
+        ra_new = self.ptsrc_ra + self.ptsrc_delta_ra
+        dec_new = self.ptsrc_dec + self.ptsrc_delta_dec
+        flux = self.ptsrc_flux * self.ptsrc_flux_factor
+        nsrc = ra_new.size
+        sky_model = SkyModel(
+                            ra=Longitude(ra_new, unit='rad'),
+                            dec=Latitude(dec_new, unit='rad'),
+                            stokes=np.array(
+                                [
+                                    flux,                       # Stokes I
+                                    np.zeros((len(self._freqs), nsrc)), # Stokes Q = 0
+                                    np.zeros((len(self._freqs), nsrc)), # Stokes U = 0
+                                    np.zeros((len(self._freqs), nsrc)), # Stokes V = 0
+                                ]
+                            ),
+                            name=np.array(["sources"] * nsrc),
+                            spectral_type="full",
+                            freq_array=self._freqs,
+                        )
+        data_model = ModelData(uvdata=self.uvd, 
+                               sky_model=sky_model,
+                               beams=self.beams)
+
+        # Initialise VisCPU handler object
+        viscpu = VisCPU(use_pixel_beams=False, 
+                        precision=2, 
+                        mpi_comm=comm, 
+                        **self.extra_opts_viscpu)
+
+        # Create a VisibilitySimulation object
+        simulator_ptsrc = VisibilitySimulation(data_model=data_model, 
+                                               simulator=viscpu)
         
         # Run simulation
         if self.verbose:
-            print("  Beginning simulation")
+            print("  Beginning ptsrc simulation")
         tstart = time.time()
-        simulator.simulate()
+        vis = simulator_ptsrc.simulate()
         if self.verbose:
             print("  Simulation took %2.1f sec" % (time.time() - tstart))
-    
-        #if myid != 0:
-        #    # Wait for root worker to finish IO before ending all other worker procs
-        #    comm.Barrier()
-        #    sys.exit(0)
         
-        return simulator.uvdata
+        return simulator_ptsrc.uvdata
     
     
     def simulate_diffuse(self, comm=None):
@@ -535,26 +531,40 @@ class VisModel(object):
         uvd : UVData object
             Simulated visibilities.
         """
-        obs = self.healvis_observatory
+        if not self.include_diffuse:
+            raise ValueError("Diffuse model is disabled because include_diffuse=False")
+
+        # Copy the UVData object
+        uvd = copy.deepcopy(self.uvd)
+
+        # Need to zero the array, which is usually returned by 
+        # reference rather than copied
+        uvd.data_array *= 0.
+
+        # Construct a data model with the latest beams
+        data_model = ModelData(uvdata=uvd, 
+                               sky_model=self.gsm_sky,
+                               beams=self.beams)
+
+        # Initialise VisCPU handler object
+        viscpu = VisCPU(use_pixel_beams=False, 
+                        precision=2, 
+                        mpi_comm=comm, 
+                        **self.extra_opts_viscpu)
+
+        # Create a VisibilitySimulation object
+        simulator_diffuse = VisibilitySimulation(data_model=data_model, 
+                                                 simulator=viscpu)
         
         # Run simulation
         if self.verbose:
-            print("  Beginning simulation")
+            print("  Beginning diffuse simulation")
         tstart = time.time()
-        
-        # Compute visibilities
-        # FIXME: Use vis_cpu for diffuse emission instead
-        # FIXME: Need to use polarisation info properly
-        gsm_vis, _times, _bls = obs.make_visibilities(
-                                        self.diffuse_gsm,
-                                        beam_pol=self.healvis_opts['beam_pol'], 
-                                        Nprocs=self.healvis_opts['Nprocs'] )
-        
+        vis = simulator_diffuse.simulate()
         if self.verbose:
             print("  Simulation took %2.1f sec" % (time.time() - tstart))
         
-        self.diffuse_vis = gsm_vis
-        return gsm_vis, _times, _bls
+        return simulator_diffuse.uvdata
     
     
     def parameter_vector(self, antpos_params, beam_params, gain_params, 
@@ -672,23 +682,10 @@ class VisModel(object):
         
         # Run diffuse model simulation
         if self.include_diffuse:
-            vis_gsm, _times, _bls = self.simulate_diffuse()
-            
-            # Check that ordering of healvis output matches existing uvd object
-            antpairs_hvs = [(self.healvis_bls[i].ant1, self.healvis_bls[i].ant2) 
-                            for i in _bls]
-            antpairs_uvd = [_uvd.baseline_to_antnums(_b) 
-                            for _b in _uvd.baseline_array]
-            
-            assert antpairs_hvs == antpairs_uvd, \
-                                     "healvis 'bls' array does not match the " \
-                                     "ordering of existing UVData.baseline_array"
-            assert np.all(_times == uvd.time_array), \
-                                     "healvis 'times' array does not match the " \
-                                     "ordering of existing UVData.time_array"
+            uvd_gsm = self.simulate_diffuse()
             
             # Add diffuse data to UVData object
-            _uvd.data_array[:,:,:,0] += vis_gsm
+            _uvd.data_array[:,:,:,:] += uvd_gsm.data_array[:,:,:,:]
         
         # Apply gain model
         _uvd = self.apply_gains(_uvd)
@@ -697,4 +694,52 @@ class VisModel(object):
         self.uvd = _uvd
         return _uvd
 
-        
+
+def VisModelPerWorker(**kwargs):
+    """
+    Splits a VisModel object into multiple instances, each with a different frequency 
+    range. Each instance will be owned by a different MPI worker.
+
+    NOTE: Must have more frequencies than workers.
+    NOTE: Each returned `VisModel` instance will have `comm=None`, so it thinks it is a 
+          single-process instance.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Arguments for the `VisModel` constructor.
+    """
+    # Return a single instance if no MPI comm is specified 
+    if 'comm' not in kwargs.keys() or kwargs.get('comm') is None:
+        return VisModel(**kwargs)
+
+    # Get MPI communicator
+    comm = kwargs.pop('comm')
+    myid = comm.Get_rank()
+    nworkers = comm.Get_size()
+
+    # Get UVData object and down-select frequency channels
+    uvd_init = kwargs.pop('uvd_init')
+    freqs = np.unique(uvd_init.freq_array)
+    if nworkers > freqs.size:
+        raise ValueError("More MPI workers (%d) than frequency channels (%d)." \
+                         % (nworkers, freqs.size))
+
+    # Split frequency array into chunks managed by each worker
+    freq_chunk = np.array_split(freqs, nworkers)[myid]
+    idxs = np.array_split(np.arange(freqs.size), nworkers)[myid]
+
+    # Create a VisModel per worker (array_split() splits into roughly equal-length 
+    # contiguous parts)
+    # NOTE: This will pass comm=None to the VisModel constructor, so each worker's 
+    # copy of VisModel thinks it is a single-process instance.
+    my_uvd_init = uvd_init.select(frequencies=freq_chunk, inplace=False)
+    
+    # Down-select frequency channels from input point-source flux array
+    ptsrc_flux = kwargs.pop('ptsrc_flux')
+    my_ptsrc_flux = None
+    if ptsrc_flux is not None:
+        my_ptsrc_flux = ptsrc_flux[idxs,:]
+
+    # Return VisModel instance for each worker
+    return VisModel(uvd_init=my_uvd_init, ptsrc_flux=my_ptsrc_flux, **kwargs)
