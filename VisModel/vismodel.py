@@ -19,11 +19,13 @@ class VisModel(object):
     
     def __init__(self, uvd_init=None, 
                  ptsrc_ra=None, ptsrc_dec=None, ptsrc_flux=None,
+                 diffuse_amp=1.,
                  beam_model=PerturbedPolyBeam, 
                  gain_model=None,
                  default_beam_params={},
                  free_params_antpos=[], free_params_beam=[], 
                  free_params_ptsrc=[], free_params_gains=[],
+                 free_params_diffuse=[],
                  free_beams=[], free_ants=[], free_ants_gains=[], 
                  free_ptsrcs=[], 
                  extra_opts_viscpu={},
@@ -44,6 +46,9 @@ class VisModel(object):
         ptsrc_ra, ptsrc_dec, ptsrc_flux : array_like
             Point source position and flux arrays. RA and Dec should be in radians.
         
+        diffuse_amp : float, optional
+            Diffuse model overall amplitude factor.
+
         beam_model : UVBeam, optional
             Beam model class to be used for the primary beams.
             Default: PerturbedPolyBeam
@@ -57,7 +62,8 @@ class VisModel(object):
         default_beam_params : dict
             Default values of all beam model parameters.
         
-        free_params_antpos, free_params_beam, free_params_ptsrc, free_params_gains : lists of str
+        free_params_antpos, free_params_beam, free_params_ptsrc, 
+        free_params_gains, free_params_diffuse : lists of str
             Ordered lists of names of parameters to be varied. The ordering 
             maps to the parameter vector.
         
@@ -149,11 +155,15 @@ class VisModel(object):
         assert self.ptsrc_ra.size >= len(free_ptsrcs), \
             "free_ptsrcs must not have more sources than the total no. of sources in the sky model"
         
+        # Diffuse parameters
+        self.diffuse_amp = diffuse_amp
+
         # Mappings between param vector and param names
         self.free_params_antpos = free_params_antpos
         self.free_params_beam = free_params_beam
         self.free_params_ptsrc = free_params_ptsrc
         self.free_params_gains = free_params_gains
+        self.free_params_diffuse = free_params_diffuse
         self.free_beams = free_beams
         self.free_ants = free_ants
         self.free_ants_gains = free_ants_gains
@@ -265,6 +275,20 @@ class VisModel(object):
                              params[self.free_params_ptsrc.index('flux_factor')]
     
     
+    def set_diffuse_params(self, params):
+        """
+        Set the parameters of the diffuse model.
+
+        Parameters
+        ----------
+        params : array_like
+            Vector of parameters. Names and ordering are defined 
+            in `self.free_params_diffuse`.
+        """
+        if 'diffuse_amp' in self.free_params_diffuse:
+            self.diffuse_amp = params[self.free_params_diffuse.index('diffuse_amp')]
+
+
     def set_gain_params(self, ant, params, pol=None):
         """
         Set the free parameters of the complex gain model for an antenna. This 
@@ -402,6 +426,10 @@ class VisModel(object):
             for p in self.free_params_ptsrc:
                 pnames.append("%s_%06d" % (p, i))
         
+        # Diffuse model parameters
+        for p in self.free_params_diffuse:
+            pnames.append("%s" % p)
+
         return pnames
     
 
@@ -564,11 +592,14 @@ class VisModel(object):
         if self.verbose:
             print("  Simulation took %2.1f sec" % (time.time() - tstart))
         
+        # Apply overall amplitude factor
+        simulator_diffuse.uvdata.data_array[:,:,:,:] *= self.diffuse_amp
+
         return simulator_diffuse.uvdata
     
     
     def parameter_vector(self, antpos_params, beam_params, gain_params, 
-                         ptsrc_params):
+                         ptsrc_params, diffuse_params):
         """
         Construct a global parameter vector from individual parameter vectors 
         for each type of parameter.
@@ -587,6 +618,9 @@ class VisModel(object):
         ptsrc_params : array_like
             Point source parameters, of shape (Nfree_ptsrcs, Nparams_ptsrcs).
         
+        diffuse_params : array_like
+            Diffuse model parameters, of shape (Nparams_diffuse,).
+
         Returns
         -------
         params : array_like
@@ -601,12 +635,14 @@ class VisModel(object):
         Nparams_beams = len(self.free_params_beam)
         Nparams_gains = len(self.free_params_gains)
         Nparams_ptsrcs = len(self.free_params_ptsrc)
+        Nparams_diffuse = len(self.free_params_diffuse)
         
         # Check shapes
         assert antpos_params.shape == (Nfree_ants, Nparams_ants)
         assert beam_params.shape == (Nfree_beams, Nparams_beams)
         assert gain_params.shape == (Nfree_ants_gains, Nparams_gains)
         assert ptsrc_params.shape == (Nfree_ptsrcs, Nparams_ptsrcs)
+        assert diffuse_params.shape == (Nparams_diffuse,)
         
         # Initialise empty parameter array
         Ntot = Nfree_ants * Nparams_ants + Nfree_beams * Nparams_beams \
@@ -618,10 +654,12 @@ class VisModel(object):
         ibeams = Nfree_beams * Nparams_beams
         igains = Nfree_ants_gains * Nparams_gains
         iptsrcs = Nfree_ptsrcs * Nparams_ptsrcs
+        idiffuse = Nparams_diffuse
         params[0:iants] = antpos_params.flatten()
         params[iants:iants+ibeams] = beam_params.flatten()
         params[iants+ibeams:iants+ibeams+igains] = gain_params.flatten()
         params[iants+ibeams+igains:iants+ibeams+igains+iptsrcs] = ptsrc_params.flatten()
+        params[iants+ibeams+igains+iptsrcs:iants+ibeams+igains+iptsrcs+idiffuse] = diffuse_params.flatten()
         
         return params
     
@@ -648,18 +686,22 @@ class VisModel(object):
         Nparams_beams = len(self.free_params_beam)
         Nparams_gains = len(self.free_params_gains)
         Nparams_ptsrcs = len(self.free_params_ptsrc)
+        Nparams_diffuse = len(self.free_params_diffuse)
         
         # Extract parameters in blocks and reshape
         iants = Nfree_ants * Nparams_ants
         ibeams = Nfree_beams * Nparams_beams
         igains = Nfree_ants_gains * Nparams_gains
         iptsrcs = Nfree_ptsrcs * Nparams_ptsrcs
+        idiffuse = Nparams_diffuse
         antpos_params = params[0:iants].reshape((Nfree_ants, Nparams_ants))
         beam_params = params[iants:iants+ibeams].reshape((Nfree_beams, Nparams_beams))
         gain_params = params[iants+ibeams:iants+ibeams+igains].reshape(
                                               (Nfree_ants_gains, Nparams_gains))
         ptsrc_params = params[iants+ibeams+igains:iants+ibeams+igains+iptsrcs].reshape(
                                               (Nfree_ptsrcs, Nparams_ptsrcs))
+        diffuse_params = params[iants+ibeams+igains+iptsrcs:iants+ibeams+igains+iptsrcs+idiffuse].reshape(
+                                              (Nparams_diffuse,))
         
         # (1) Antenna positions
         for i, ant in enumerate(self.free_ants):
@@ -677,6 +719,9 @@ class VisModel(object):
         for i in self.free_ptsrcs:
             self.set_ptsrc_params(i, ptsrc_params[i])
         
+        # (5) Diffuse model parameters
+        self.set_diffuse_params(diffuse_params)
+
         # Run point source simulation
         _uvd = self.simulate_point_sources()
         
